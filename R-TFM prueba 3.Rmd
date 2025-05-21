@@ -916,7 +916,7 @@ somaticInteractions(
   colPal = "BrBG",
   showSum = TRUE,
   colNC = 9,
-  # nShiftSymbols = 5,
+  nShiftSymbols = 5,
   sigSymbolsSize = 2,
   sigSymbolsFontSize = 0.9,
   pvSymbols = c(46, 42),
