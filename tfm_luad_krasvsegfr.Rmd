@@ -1,0 +1,1485 @@
+---
+title: "Identificación de patrones mutacionales específicos de distintos tipos de adenocarcinomas de pulmón"
+author: "David Sánchez Sierra"
+date: "2025-02-27"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: false
+    theme: default
+    css: styles.css
+    output_dir: "output"
+  pdf_document:
+    output_dir: "output"
+  word_document:
+    output_dir: "output"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# TFM
+
+## 1. Paquetes empleados en el informe.
+
+Este proyecto utiliza el paquete renv para gestionar de forma reproducible el entorno de trabajo en R.
+
+```{r, include=FALSE}
+renv::snapshot()
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(dplyr)
+library(DT)
+library(maftools)
+library(TCGAmutations)
+library(MultiAssayExperiment)
+library(HGNChelper)
+library(ComplexHeatmap)
+library(NMF)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(tibble)
+library(MutationalPatterns)
+library(tidyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(openxlsx)
+```
+
+## 2. Preprocesamiento de datos y generación de cohortes LUAD y KRAS
+
+### 2.1. Descarga de datos mutacionales
+
+Para la identificación y caracterización de variantes somáticas en adenocarcinomas de pulmón (LUAD) se empleó el conjunto de datos MC3 de TCGA, accesible desde R mediante el paquete TCGAmutations.
+
+```{r, message=FALSE}
+luad <- TCGAmutations::tcga_load(study = "LUAD")
+```
+
+El archivo descargado corresponde a un formato MAF (Mutation Annotation Format), que es un estándar para representar datos de variantes somáticas en cáncer.
+
+El objeto resultante es una instancia de la clase MAF, la cual contiene múltiples "slots" o componentes con diferentes tipos de información relevante para el análisis mutacional, tales como los datos de variantes, anotaciones clínicas, y metadatos asociados.
+
+Para conocer la estructura del objeto y los nombres de sus slots, podemos ejecutar:
+
+```{r}
+slotNames(luad)
+```
+
+### 2.2. Preprocesamiento del archivo MAF MC3
+
+#### 2.2.1. Corrección HGNC
+
+El archivo MAF de MC3 sólo incluye mutaciones que afectan a genes. La nomenclatura empleada para definir dichos genes es HGNC, aunque no se garantiza la existencia de genes desactualizados o incorrectamente nombrados. Para prevenir errores de este tipos, es recomendable realizar una revisión utilizando el paquete `HGNChelper`, que permite verificar la validez de los símbolos de los genes y sugiere correcciones cuando sea necesario.
+
+```{r, include=FALSE}
+install.packages("HGNChelper", repos = "https://cloud.r-project.org")
+```
+
+```{r, warning=FALSE, message=FALSE}
+luad_HGNC <- luad
+
+# 1. Extraer símbolos originales
+orig_symbols <- luad_HGNC@data$Hugo_Symbol
+
+# 2. Obtener sugerencias y mapeo
+df_map <- checkGeneSymbols(orig_symbols)
+df_map$corrected <- with(df_map,
+  ifelse(
+    !Approved & !is.na(Suggested.Symbol) & Suggested.Symbol != "",
+    Suggested.Symbol,
+    x
+  )
+)
+
+# 3. Aplicar corrección
+luad_HGNC@data$Hugo_Symbol <- df_map$corrected
+
+# 4. Regeneral el resumen
+luad_HGNC@gene.summary <- getGeneSummary(luad_HGNC)
+
+# 5. Comprobar cambios
+cambios_simbolos <- data.frame(
+  original  = orig_symbols,
+  corrected = df_map$corrected
+)
+cambios_simbolos <- subset(cambios_simbolos, original != corrected)
+head(cambios_simbolos)
+```
+
+#### 2.2.2. Filtrado de FLAGS (25)
+
+Los archivos MAF de cada cohorte se filtraron, eliminando los genes frecuentemente mutados (FLAGS) sin relevancia clínica usando la lista de Shyr y colaboradores (2013), que contiene un total de 19721 genes ordenados por su score FLAG (probabilidad de pertenencia según su frecuencia mutacional). Los 25 genes con mayor score fueron eliminados mediante la función subsetMaf del paquete Maftools.
+
+```{r}
+# Seleccionar Top 25 FLAGS
+flags <- read.table("data/Tabla_FLAGS_ranked.txt", header = FALSE, stringsAsFactors = FALSE)
+flags_eliminar <- flags$V1[1:25]
+flags_eliminar
+
+# Seleccionar genes mutados
+todos_los_genes <- getGeneSummary(luad_HGNC)$Hugo_Symbol
+summary(todos_los_genes)
+
+# Seleccionar genes a mantener
+genes_a_mantener <- setdiff(todos_los_genes, flags_eliminar)
+summary(genes_a_mantener)
+```
+
+```{r, warning=FALSE, message=FALSE}
+# Crear MAF filtrado.
+maf_LUAD_SinFlags <- subsetMaf(
+  maf = luad_HGNC, 
+  genes = genes_a_mantener,
+  )
+
+# Comparar
+dim(maf_LUAD_SinFlags@data)
+dim(luad_HGNC@data)
+```
+
+#### 2.2.3. Definición de cohortes
+
+Para definir las cohortes se empleó la función `genesToBarcodes` de maftools. Esta función extrae los barcodes de las muestras donde se han detectado mutaciones en los genes especificados. En este caso, se seleccionaron los genes KRAS y EGFR, frecuentes en adenocarcinomas de pulmón
+
+```{r}
+# Definir genes de interés
+genes_interes <- c("KRAS", "EGFR")
+
+# Extraer barcodes para los genes de interés
+barcodes <- genesToBarcodes(
+  maf = maf_LUAD_SinFlags,
+  genes = genes_interes,
+  justNames = FALSE
+)
+```
+
+```{r, warning=FALSE, message=FALSE}
+# Filtrar MAF para cada cohorte
+
+# Unir barcodes únicos
+barcodes_union <- unique(c(barcodes$KRAS[[1]], barcodes$EGFR[[1]]))
+
+# MAF para muestras con mutación en KRAS o EGFR
+maf_kras_egfr <- subsetMaf(maf = maf_LUAD_SinFlags, tsb = barcodes_union)
+
+# MAF para muestras KRAS
+maf_kras <- subsetMaf(maf = maf_LUAD_SinFlags, tsb = barcodes$KRAS[[1]])
+
+# MAF para muestras EGFR
+maf_egfr <- subsetMaf(maf = maf_LUAD_SinFlags, tsb = barcodes$EGFR[[1]])
+```
+
+A partir de los barcodes, se generaron tres subconjuntos del archivo MAF original: uno con muestras mutadas en KRAS, otro con muestras mutadas en EGFR, y un tercero que incluye todas las muestras con mutaciones en cualquiera de los dos genes.
+
+## 3. Análisis MAFTOOLs
+
+### 3.1. Perfil mutacional global de las cohortes
+
+Para caracterizar el perfil mutacional global, se calculó el resumen estadístico por cohorte con la función plotmafSummary(), eliminando outliers y generando gráficos de tipo dashboard con las principales características mutacionales:
+
+```{r}
+# Caracterización general
+plotmafSummary(maf = maf_kras, 
+               rmOutlier = TRUE, 
+               addStat = 'median', 
+               dashboard = TRUE, 
+               titleSize = c(1.0, 1.2))
+
+plotmafSummary(maf = maf_egfr, 
+               rmOutlier = TRUE, 
+               addStat = 'median', 
+               dashboard = TRUE, 
+               titleSize = c(1.2, 1.2))
+```
+
+El gráfico muestra la clasificación funcional de las variantes, los tipos de mutación, la distribución de clases de SNVs (transiciones y transversiones), el número de mutaciones por paciente y los diez genes más mutados en cada cohorte. La distribución de transiciones y transversiones (Ti/Tv) no muestra diferencias inesperadas, siendo coherente con lo descrito en adenocarcinomas pulmonares, donde son frecuentes las transiciones C\>T por desaminación espontánea y las transversiones C\>A asociadas al daño inducido por el tabaco. Además, en ambas cohortes predominan las mutaciones missense, aunque KRAS presenta una mayor carga mutacional total y más variantes por muestra (mediana de 183 frente a 59.5 en EGFR).
+
+```{r, include=FALSE}
+# Guardar gráfico de KRAS
+png("figures/maf_summary_kras.png", width = 1200, height = 800, res = 180)
+plotmafSummary(maf = maf_kras, 
+               rmOutlier = TRUE, 
+               addStat = 'median', 
+               dashboard = TRUE, 
+               titleSize = c(1.1, 1.2))
+dev.off()
+
+# Guardar gráfico de EGFR
+png("figures/maf_summary_egfr.png", width = 1200, height = 800, res = 180)
+plotmafSummary(maf = maf_egfr, 
+               rmOutlier = TRUE, 
+               addStat = 'median', 
+               dashboard = TRUE, 
+               titleSize = c(1.1, 1.2))
+dev.off()
+```
+
+La diferencia en la carga mutacional total (TMB) se confirmó mediante un análisis estadístico de Wilcoxon, revelando una TMB significativamente superior en KRAS (p \< 0.0001).
+
+```{r, include=FALSE}
+# Calculamos TMB para cada cohorte sin plot
+tmb_kras <- tmb(maf_kras, captureSize = 50, logScale = FALSE, )
+tmb_kras$cohort <- "KRAS"
+
+tmb_egfr <- tmb(maf_egfr, captureSize = 50, logScale = FALSE)
+tmb_egfr$cohort <- "EGFR"
+
+# Unimos los datos
+tmb_df <- rbind(tmb_kras, tmb_egfr)
+```
+
+```{r, warning=FALSE, message=FALSE}
+# Graficamos
+TMS_gráfico <- ggplot(tmb_df, aes(x = cohort, y = total_perMB, fill = cohort)) +
+  geom_boxplot(width = 0.3, outlier.shape = NA, color = "black", alpha = 0.5) +  # solo boxplot
+  geom_jitter(width = 0.1, size = 1.5, alpha = 0.7) +  # puntos individuales
+  stat_compare_means(method = "wilcox.test", label = "p.format") +  # test Wilcoxon
+  scale_fill_manual(values = c("EGFR" = "steelblue", "KRAS" = "firebrick")) +
+  labs(x = "Cohorte", y = "Carga Mutacional (mut/Mb)") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.title.x = element_text(face = "bold"),
+    axis.title.y = element_text(face = "bold"),
+    legend.position = "none",
+    panel.grid = element_blank(),          # Quita líneas de fondo
+    panel.border = element_blank(),        # Quita borde del panel
+    axis.line = element_line(color = "lightgrey", size = 0.5)  # Añade líneas de los ejes
+  )
+TMS_gráfico
+```
+
+```{r, include=FALSE}
+ggsave("figures/TMB_comparison.png", plot = TMS_gráfico, width = 3.5, height = 9, dpi = 300)
+```
+
+Los diez genes más frecuentemente mutados y significativamente alterados (FDR \< 0.1) en cada cohorte fueron comparados mediante un oncoplot para analizar sus frecuencias relativas en pacientes KRAS y EGFR.
+
+```{r}
+# 1. Extraer los 10 genes más mutados en cada cohorte como VECTOR de caracteres
+top10_kras <- as.character(getGeneSummary(maf_kras)$Hugo_Symbol[1:10])
+top10_egfr <- as.character(getGeneSummary(maf_egfr)$Hugo_Symbol[1:10])
+
+# 2. Unir y eliminar duplicados explícitamente
+top_genes <- unique(c(top10_kras, top10_egfr))
+
+# Comparación de los genes más mutados en ambas cohortes
+coOncoplot(
+  m1 = maf_kras, 
+  m2 = maf_egfr,
+  m1Name = "LUAD KRAS", 
+  m2Name = "LUAD EGFR",
+  genes = top_genes
+)
+```
+
+Seis de los diez genes con mayor frecuencia mutacional en cada cohorte fueron compartidos entre ambas, mientras que los cuatro restantes fueron exclusivos de cada grupo. En total, se representaron 14 genes únicos en el oncoplot conjunto.
+
+Entre las diferencias encontradas, destaca LRP1B, un gen identificado como supresor tumoral cuya inactivación favorece la acumulación de variantes, aumentando la TMB. El mismo patrón se observa en nuestro estudio, donde la frecuencia mutacional de LRP1B es del 41% en KRAS frente al 13% en EGFR, coincidiendo con una mayor TMB en la primera cohorte. De manera similar, ZFHX4 presentó una frecuencia más alta en la cohorte KRAS (38%) en comparación con EGFR (19%), aunque su papel específico en LUAD requiere mayor estudio, esta diferencia sugiere un perfil molecular distintivo en pacientes KRAS-mutados. En contraste, la mutación de TP53 fue más común en la cohorte EGFR (63%) que en KRAS (35%), y su co-mutación con EGFR se ha asociado a un peor pronóstico y una respuesta terapéutica menos favorable65. Finalmente, STK11, una alteración recurrente en tumores KRAS-mutados (24%), fue casi inexistente en la cohorte EGFR (1%). Además, las mutaciones en STK11 se han vinculado con una respuesta reducida a inhibidores de PD-1 y con peores resultados clínicos en pacientes KRAS66. Estas diferencias en el perfil mutacional refuerzan la idea de que los subtipos de LUAD con mutaciones en KRAS y EGFR representan paisajes genómicos divergentes, reflejando distintos mecanismos moleculares y posiblemente diferentes comportamientos clínicos y terapéuticos, como se ha descrito en estudios previos. Este análisis se profundiza en los apartados siguientes.
+
+```{r, include=FALSE}
+png("figures/coOncoplot_KRAS_vs_EGFR.png", width = 1850, height = 1100, res = 180)
+coOncoplot(
+  m1 = maf_kras, 
+  m2 = maf_egfr,
+  m1Name = "LUAD KRAS", 
+  m2Name = "LUAD EGFR",
+  genes = top_genes
+)
+dev.off()
+```
+
+### 3.2. Análisis de firmas mutacionales: Índice de correlación cophenética
+
+La progresión de cada tipo de cancer causa un patrón mutacional característico subyacente. Estos previos han demostrado que estos procesos mutagénicos pueden ser identificados utilizando técnicas de reducción dimensional, como la factorización de matrices no negativa (NMF). Específicamente, este método clasifica las SNVs en seis diferentes eventos de transición y transversión, cada uno de los cuales se clasifica en 16 subtipos basados en las bases inmediatas 5′ y 3′ que rodean la base mutada. El análisis típico de firmas de novo incluye la generación de una matriz de frecuencias y la descomposición por NMF.
+
+Se implementaran tres funciones, denominadas `trinucleotideMatrix`, `nmfEstimateRank` y `extractSignatures` para la extracción de firmas mutacionales. Estas funciones permiten generar una matriz de trinucleótidos, estimar el número óptimo de firmas mutacionales y extraer qué firmas mutacionales caracterizan el MAF. Estas firmas mutacionales son "combinaciones" específicas de mutaciones que se encuentran con frecuencia en ciertos tipos de cáncer y que están asociadas con diferentes procesos o factores mutagénicos.
+
+#### 3.2.1. Generación de la matriz de trinucleótidos
+
+El primer paso consiste en generar la matriz de trinucleótidos a partir del objeto maf. La función `trinucleotideMatrix()` toma como entrada el objeto maf y genera una matriz de frecuencias de trinucleótidos para cada muestra. Esta matriz es esencial para el análisis posterior de firmas mutacionales.
+
+```{r, warning=FALSE, message=FALSE}
+# Generar la matriz de trinucleótidos
+
+triMatrix_kras <- trinucleotideMatrix(
+  maf        = maf_kras,  # objeto maf,
+  ref_genome = "BSgenome.Hsapiens.UCSC.hg19",  
+  prefix     = "chr",                         
+  add        = TRUE
+)
+
+triMatrix_egfr <- trinucleotideMatrix(
+  maf        = maf_egfr,  # objeto maf,
+  ref_genome = "BSgenome.Hsapiens.UCSC.hg19",  
+  prefix     = "chr",                         
+  add        = TRUE
+)
+```
+
+#### 3.2.2. Estimación n óptimo
+
+La correlación cophenética permite evaluar la calidad de un análisis de agrupamiento jerárquico. En el análisis de firmas mutacionales, las técnicas de descomposición de matrices como la factorización de matrices no negativas (NMF) se usan para descomponer el conjunto de datos en "firmas" de mutación. El índice de correlación cophenética compara la distancia entre los grupos de datos (en este caso, los patrones de mutación) en un dendrograma con las distancias reales entre los puntos de datos. Un valor alto indica que el agrupamiento jerárquico refleja bien la estructura de los datos, mientras que un valor bajo sugiere que el agrupamiento no es representativo. En el contexto de la estimación de firmas mutacionales, un índice cophenético alto sugiere que las firmas extraídas son robustas y representan bien los patrones de mutación en los datos.
+
+Por ende, hay que calcular el número óptimo de firmas mutacionales (n) a partir de la matriz de trinucleótidos generada, siendo n aquel que genere el mejor índice de correlación cophenética, varianza explicada, silueta, residuos y demás métricas de calidad. Esto se consigue mediante la función `nmfEstimateRank()` del paquete NMF. Esta función evalúa diferentes números de firmas y calcula el valor de las distintas métricas para cada uno:
+
+```{r}
+# Extraer matrices generadas
+mat_kras <- triMatrix_kras[[1]]
+mat_egfr <- triMatrix_egfr[[1]]
+
+# Estimar rango de firmas (de 2 a 6)
+n_est_kras <- nmfEstimateRank(
+  mat_kras,
+  range  = 2:6,
+  method = "brunet",
+  nrun   = 10,      # repeticiones para estabilidad
+  seed   = 123456,
+  .opt   = "p4"     # usa 4 núcleos
+)
+
+n_est_egfr <- nmfEstimateRank(
+  mat_egfr,
+  range  = 2:6,
+  method = "brunet",
+  nrun   = 10,      # repeticiones para estabilidad
+  seed   = 123456,
+  .opt   = "p4"     # usa 4 núcleos
+)
+```
+
+```{r}
+# Graficar el coeficiente cofenético vs. número de firmas
+plot(n_est_kras, main = "KRAS")
+plot(n_est_egfr, main = "EGFR")
+```
+
+Tras analizar los gráficos, para la cohorte KRAS se seleccionó n = 3, ya que este valor maximiza el coeficiente cophenético y, en conjunto con los perfiles de varianza explicada, residuos e índice de silueta, ofrece la mejor combinación de estabilidad y calidad de reconstrucción. Respecto a la cohorte EGFR, n = 4 demostró ser el valor óptimo, logrando un coeficiente cophenético mayor y un índice de silueta superior al resto de los valores evaluados.
+
+```{r, include=FALSE}
+# Guardar el plot de n_est_kras
+png(filename = "figures/n_est_kras.png", width = 800, height = 600, res = 120)
+plot(n_est_kras, main = "KRAS")
+dev.off()
+
+# Guardar el plot de n_est_egfr
+png(filename = "figures/n_est_egfr.png", width = 800, height = 600, res = 120)
+plot(n_est_egfr, main = "EGFR")
+dev.off()
+```
+
+#### 3.2.3. Firmas y análisis de enriquecimiento
+
+Establecido un n óptimo para cada cohorte, queda estimar las firmas mutacionales mediante la función `extractSignatures`. Esta función aplica la factorización de matrices no negativa (NMF) a la matriz de trinucleótidos. Con ello, se descompone la matriz en un número especificado de firmas y se devuelve una lista que contiene las firmas identificadas y sus pesos correspondientes:
+
+```{r, warning=FALSE, message=FALSE}
+# Extraccción de firmas mutacionales
+
+signatures_kras <- extractSignatures(
+  triMatrix_kras,
+  n = 3,  # número óptimo de firmas
+  plotBestFitRes = TRUE,
+  parallel = 8,
+  pConstant = NULL
+)
+
+signatures_egfr <- extractSignatures(
+  triMatrix_egfr,
+  n = 4,  # número óptimo de firmas
+  plotBestFitRes = TRUE,
+  parallel = 8,
+  pConstant = NULL
+)
+```
+
+```{r}
+plotSignatures(
+  nmfRes = signatures_kras,
+  contributions = FALSE,
+  color = NULL,
+  patient_order = NULL,
+  font_size = 1.2,
+  show_title = TRUE,
+  sig_db = "SBS",
+  axis_lwd = 2,
+  title_size = 1,
+  show_barcodes = FALSE,
+  yaxisLim = 0.2
+)
+
+plotSignatures(
+  nmfRes = signatures_egfr,
+  contributions = FALSE,
+  color = NULL,
+  patient_order = NULL,
+  font_size = 1.2,
+  show_title = TRUE,
+  sig_db = "SBS",
+  axis_lwd = 2,
+  title_size = 1,
+  show_barcodes = FALSE,
+  yaxisLim = 0.2
+)
+```
+
+```{r, include=FALSE}
+# Guardar gráfico de firmas KRAS
+png("figures/signatures_kras.png", width = 600, height = 700, res = 100)
+plotSignatures(
+  nmfRes = signatures_kras,
+  contributions = FALSE,
+  color = NULL,
+  patient_order = NULL,
+  font_size = 2,
+  show_title = TRUE,
+  sig_db = "SBS",
+  axis_lwd = 1,
+  title_size = 1.6,
+  show_barcodes = FALSE,
+  yaxisLim = 0.2
+)
+dev.off()
+
+# Guardar gráfico de firmas EGFR
+png("figures/signatures_egfr.png", width = 600, height = 700, res = 100)
+plotSignatures(
+  nmfRes = signatures_egfr,
+  contributions = FALSE,
+  color = NULL,
+  patient_order = NULL,
+  font_size = 1.9,
+  show_title = TRUE,
+  sig_db = "SBS",
+  axis_lwd = 1,
+  title_size = 1.6,
+  show_barcodes = FALSE,
+  yaxisLim = 0.2
+)
+dev.off()
+```
+
+Con sig_db = "SBS", `plotSignatures()` superpone las firmas extraídas con las firmas de referencia de la base de datos COSMIC, escalando o ajustando los datos con la finalidad de identificar similitudes entre las firmas mutacionales de cada cohorte y las firmas conocidas, lo que puede proporcionar información sobre los procesos mutagénicos subyacentes. La función calcula la similitud coseno entre la firma de novo encontrada con las firmas registradas, donde valores cercanos a 1 indican perfiles muy similares.
+
+##### 3.2.3.1. Análisis de enriquecimiento
+
+Para evaluar que firmas mutacionales están enriquecidas en cada cohorte, se agruparon las contribuciones de cada firma en los pacientes, sumando la proporción de mutaciones atribuidas a cada firma. Esta información se encuentra contenida en el objeto contributions generado en el análisis de firmas. Al agrupar las contribuciones por firma y por individuo, es posible comparar de forma directa la prevalencia de cada proceso mutacional entre los grupos KRAS y EGFR y detectar diferencias en su distribución:
+
+```{r}
+# Renombrar firmas KRAS
+colnames(signatures_kras$signatures) <- c("SBS2 (APOBEC)", "SBS4 (Tabaco)", "SBS6 (MMR)")
+rownames(signatures_kras$contributions) <- c("SBS2 (APOBEC)", "SBS4 (Tabaco)", "SBS6 (MMR)")
+
+
+# Renombrar firmas EGFR
+colnames(signatures_egfr$signatures) <- c("SBS2 (APOBEC)", "SBS6 (MMR)", "SBS45 (Artefacto)", "SBS4 (Tabaco)")
+rownames(signatures_egfr$contributions) <- c("SBS2 (APOBEC)", "SBS6 (MMR)", "SBS45 (Artefacto)", "SBS4 (Tabaco)")
+```
+
+```{r}
+# Paso 1: Preparamos las matrices de contribuciones
+contrib_kras <- as.data.frame(t(signatures_kras$contributions))
+contrib_egfr <- as.data.frame(t(signatures_egfr$contributions))
+
+# Paso 2: Creamos un dataframe largo con la información de firma, proporción y grupo
+df_kras <- as.data.frame(contrib_kras)
+df_kras$Muestra <- rownames(df_kras)
+df_kras <- pivot_longer(df_kras, cols = -Muestra, names_to = "Firma", values_to = "Proporcion")
+df_kras$Grupo <- "KRAS"
+
+df_egfr <- as.data.frame(contrib_egfr)
+df_egfr$Muestra <- rownames(df_egfr)
+df_egfr <- pivot_longer(df_egfr, cols = -Muestra, names_to = "Firma", values_to = "Proporcion")
+df_egfr$Grupo <- "EGFR"
+
+# Paso 3: Unimos ambos datasets
+df_plot <- bind_rows(df_kras, df_egfr)
+
+# Paso 4: Calculamos la media por firma y grupo (opcional, para tabla resumen)
+media_firmas <- df_plot %>%
+  group_by(Firma, Grupo) %>%
+  summarise(Media = mean(Proporcion), .groups = "drop")
+
+# Paso 5: Filtrar firmas presentes en ambos grupos y hacer el test
+firmas_validas <- df_plot %>%
+  group_by(Firma) %>%
+  filter(n_distinct(Grupo) == 2) %>%
+  distinct(Firma) %>%
+  pull()
+
+tests <- df_plot %>%
+  filter(Firma %in% firmas_validas) %>%
+  group_by(Firma) %>%
+  summarise(
+    p_value = wilcox.test(Proporcion ~ Grupo)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "fdr"),
+    signif = case_when(
+      p_adj <= 0.00001 ~ "*****",
+      p_adj <= 0.0001 ~ "****",
+      p_adj <= 0.001 ~ "***",
+      p_adj <= 0.01  ~ "**",
+      p_adj <= 0.05  ~ "*",
+      TRUE           ~ ""
+    )
+  )
+
+# Calcular posición para texto (por encima del máximo de cada caja)
+pos_text <- df_plot %>%
+  filter(Firma %in% firmas_validas) %>%
+  group_by(Firma) %>%
+  summarise(y_pos = max(Proporcion) * 1.1) # un poco por encima del máximo
+
+tests <- left_join(tests, pos_text, by = "Firma")
+
+# Plot con asteriscos y sin outliers
+Comparación_Firmas_KRASvsEGFR <- ggplot(df_plot %>% filter(Firma %in% firmas_validas), aes(x = Firma, y = Proporcion, fill = Grupo)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_fill_manual(values = c("KRAS" = "red", "EGFR" = "blue")) +
+  labs(
+    x = "Firma SBS",
+    y = "Proporción de contribución"
+  ) +
+  geom_text(data = tests, aes(x = Firma, y = y_pos, label = signif), inherit.aes = FALSE, size = 5) +
+  theme(
+    panel.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.title = element_text(face = "bold", size = 16),     # Tamaño de títulos
+    axis.text = element_text(size = 14),                     # Tamaño de texto del eje
+    axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 0.5),
+    axis.ticks.length = unit(0.2, "cm"),
+    plot.title = element_blank()                             # Eliminar título del gráfico
+  )
+
+Comparación_Firmas_KRASvsEGFR
+```
+
+```{r, include=FALSE}
+# Guardar el gráfico de comparación de firmas
+ggsave("figures/Comparación_Firmas_KRASvsEGFR.png", 
+       plot = Comparación_Firmas_KRASvsEGFR, 
+       width = 10, height = 6, dpi = 300)
+```
+
+Estos resultados son consistentes con estudios previos, donde la firma SBS4 relacionada con el tabaco se observa con mayor frecuencia en LUAD con mutaciones KRAS. A nivel molecular, este patrón se traduce en un predominio de transversiones C\>A, característico de daños inducidos por aductos sobre guanina formados por exposición a carcinógenos del tabaco, como el benzopireno. Por el contrario, las firmas SBS2 y SBS6 presentaron una mayor contribución en tumores con mutaciones en EGFR, lo que apunta a mecanismos endógenos diferenciados.
+
+##### 3.2.3.2. Grupos fumadores y contribuciones de firmas
+
+Para analizar la influencia del tabaquismo en las firmas mutacionales, se agruparon los pacientes según su historial de tabaquismo. Se creó un dataframe que contiene el código de la muestra y el grupo de fumadores (fumador, exfumador o no fumador) para cada cohorte. Luego, se unieron estos datos con las contribuciones de firmas mutacionales para cada paciente, permitiendo comparar la carga mutacional atribuida a cada firma entre los grupos de fumadores.
+
+```{r, warning=FALSE, message=FALSE}
+datos_fumadores_kras <- as.data.frame(maf_kras@clinical.data) %>%
+   dplyr::select(Tumor_Sample_Barcode, tobacco_smoking_history) %>%
+  mutate(smoking_group = case_when(
+    tobacco_smoking_history == "Current smoker" ~ "Fumador",
+    grepl("Current reformed smoker", tobacco_smoking_history) ~ "Exfumador",
+    tobacco_smoking_history == "Lifelong Non-smoker" ~ "No fumador",
+    TRUE ~ NA_character_
+  ))
+
+datos_fumadores_egfr <- as.data.frame(maf_egfr@clinical.data) %>%
+   dplyr::select(Tumor_Sample_Barcode, tobacco_smoking_history) %>%
+  mutate(smoking_group = case_when(
+    tobacco_smoking_history == "Current smoker" ~ "Fumador",
+    grepl("Current reformed smoker", tobacco_smoking_history) ~ "Exfumador",
+    tobacco_smoking_history == "Lifelong Non-smoker" ~ "No fumador",
+    TRUE ~ NA_character_
+  ))
+```
+
+```{r, warning=FALSE, message=FALSE}
+# 1. Transponer la matriz de contribuciones
+df_contrib_kras <- as.data.frame(t(signatures_kras$contributions))
+
+# 2. Crear columna con los barcodes
+df_contrib_kras$Tumor_Sample_Barcode <- rownames(df_contrib_kras)
+
+# 3. Unir los datos de firmas con la info de fumadores
+df_joined_kras <- as.data.frame(t(signatures_kras$contributions)) %>%
+  tibble::rownames_to_column("Tumor_Sample_Barcode") %>%
+  left_join(datos_fumadores_kras, by = "Tumor_Sample_Barcode")
+
+# Contar número de pacientes por grupo de tabaquismo
+tabla_fumadores <- df_joined_kras %>%
+  filter(!is.na(smoking_group))
+
+print(table(tabla_fumadores$smoking_group))
+
+# 4. Eliminar muestras sin info de fumador y agrupar
+df_grouped_clean_kras <- df_joined_kras %>%
+  filter(!is.na(smoking_group)) %>%
+  group_by(smoking_group) %>%
+  summarise(across(starts_with("SBS"), sum, na.rm = TRUE))
+
+# 5. Convertir en matriz y renombrar
+df_mat_kras <- df_grouped_clean_kras
+smoking_labels_kras <- df_mat_kras$smoking_group
+df_mat_kras <- df_mat_kras %>% dplyr::select(-smoking_group)
+contrib_grouped_kras <- t(as.matrix(df_mat_kras))
+colnames(contrib_grouped_kras) <- smoking_labels_kras
+
+# 6. Graficar
+plot_contribution(
+  contrib_grouped_kras,
+  signatures_kras$signatures,
+  mode = "relative"
+)
+
+plot_contribution(
+  contrib_grouped_kras,
+  signatures_kras$signatures,
+  mode = "absolute"
+)
+```
+
+En la cohorte KRAS, la firma mutacional SBS4 fue la más predominante en todos los grupos de tabaquismo, incluyendo los no fumadores. Sin embargo, es importante destacar que el número de no fumadores en esta cohorte es muy reducido (8 pacientes), en comparación con los exfumadores (111) y fumadores actuales (33), de modo que la mayoría de los tumores KRAS parecen desarrollarse tras una exposición previa al tabaco. La presencia notable de SBS4 incluso en no fumadores podría explicarse por factores como la exposición pasiva al humo de tabaco u otras fuentes de carcinógenos similares que no han sido registradas en los datos clínicos. Esta observación es consistente con el papel establecido del tabaquismo como factor de riesgo predominante en adenocarcinomas con mutaciones KRAS, y sugiere que la firma SBS4 puede reflejar tanto la exposición directa como indirecta a agentes carcinogénicos derivados del tabaco.
+
+```{r}
+# 1. Transponer la matriz de contribuciones
+df_contrib_egfr <- as.data.frame(t(signatures_egfr$contributions))
+
+# 2. Crear columna con los barcodes
+df_contrib_egfr$Tumor_Sample_Barcode <- rownames(df_contrib_egfr)
+
+# 3. Unir los datos de firmas con la info de fumadores (usamos los datos de fumadores EGFR, si tienes, o los mismos datos)
+df_joined_egfr <- as.data.frame(t(signatures_egfr$contributions)) %>%
+  tibble::rownames_to_column("Tumor_Sample_Barcode") %>%
+  left_join(datos_fumadores_egfr, by = "Tumor_Sample_Barcode") # si no tienes datos_ fumadores_egfr usa datos_fumadores_kras
+
+# 4. Eliminar muestras sin info de fumador y agrupar
+df_grouped_clean_egfr <- df_joined_egfr %>%
+  filter(!is.na(smoking_group)) %>%
+  group_by(smoking_group) %>%
+  summarise(across(starts_with("SBS"), sum, na.rm = TRUE))
+
+# 5. Convertir en matriz y renombrar
+df_mat_egfr <- df_grouped_clean_egfr
+smoking_labels_egfr <- df_mat_egfr$smoking_group
+df_mat_egfr <- df_mat_egfr %>% dplyr::select(-smoking_group)
+contrib_grouped_egfr <- t(as.matrix(df_mat_egfr))
+colnames(contrib_grouped_egfr) <- smoking_labels_egfr
+
+# 6. Graficar
+plot_contribution(
+  contrib_grouped_egfr,
+  signatures_egfr$signatures,
+  mode = "relative"
+)
+plot_contribution(
+  contrib_grouped_egfr,
+  signatures_egfr$signatures,
+  mode = "absolute"
+)
+```
+
+En la cohorte EGFR se confirma una menor asociación con el tabaquismo: el número de fumadores es escaso y, en no fumadores, la señal de SBS4 es bastante débil. Si bien la contribución de SBS4 aumenta en fumadores y exfumadores, esta no es suficiente para alcanzar la magnitud observada en KRAS. En contraste, SBS6 predomina de manera clara en todos los grupos de tabaquismo, adquiriendo su máximo peso en los no fumadores tanto en términos relativos como absolutos. Esto confirma que, en ausencia de daño exógeno por tabaco u otros elementos cancerígenos, los defectos en la reparación por desajustes de bases son el motor principal del paisaje mutacional en los adenocarcinomas EGFR.
+
+```{r, include=FALSE}
+# Guardar plots en PNG
+png("figures/contribuciones_kras_relative.png", width=800, height=600, res = 175)
+plot_contribution(
+  contrib_grouped_kras,
+  signatures_kras$signatures,
+  mode = "relative"
+)
+dev.off()
+
+png("figures/contribuciones_kras_absolute.png", width=800, height=600, res = 175)
+plot_contribution(
+  contrib_grouped_kras,
+  signatures_kras$signatures,
+  mode = "absolute"
+)
+dev.off()
+
+png("figures/contribuciones_egfr_relative.png", width=800, height=600, res = 175)
+plot_contribution(
+  contrib_grouped_egfr,
+  signatures_egfr$signatures,
+  mode = "relative"
+)
+dev.off()
+
+png("figures/contribuciones_egfr_absolute.png", width=800, height=600, res = 175)
+plot_contribution(
+  contrib_grouped_egfr,
+  signatures_egfr$signatures,
+  mode = "absolute"
+)
+dev.off()
+```
+
+### 3.3. Análisis de genes diferencialmente mutados y vías enriquecidas
+
+El análisis de diferencias en carga mutacional entre las cohortes KRAS y EGFR se realizó con la función mafCompare() con la finalidad de identificar genes diferencialmente mutados (DMGs). En el análisis se consideraron todos los genes con al menos una mutación en una de las cohortes.
+
+```{r}
+mafCompare_kras_vs_egfr <- maftools::mafCompare(
+  m1 = maf_kras,
+  m2 = maf_egfr,
+  m1Name = "KRAS",
+  m2Name = "EGFR",
+  minMut = 1
+)
+```
+
+Para la visualización de los resultados se utilizó la función forestPlot(), representando gráficamente los genes diferencialmente mutados mediante sus odds ratios (OR) e intervalos de confianza, establecido un valor de significancia de p \< 0.01.
+
+```{r}
+cohort_colors <- list(KRAS = "#FF5733", EGFR = "#33C1FF")
+
+forest_Kras_vs_EGFR <- forestPlot(
+  mafCompareRes = mafCompare_kras_vs_egfr,
+  pVal = 0.01,
+  color = as.character(unlist(cohort_colors)),
+  geneFontSize = 0.7
+)
+
+sum(mafCompare_kras_vs_egfr$results$pval < 0.01)
+```
+
+Establecido un umbral de significancia de p \< 0,01 (test exacto de Fisher), se identificaron 15 genes diferencialmente mutados (DMGs) entre cohortes (Fig. 10). En el análisis, un valor de OR \> 1 indica una mayor proporción de mutaciones en la cohorte KRAS respecto a EGFR. De este modo, 11 DMGs presentaron una frecuencia de mutación significativamente mayor en la cohorte KRAS, frente a únicamente 3 genes en la cohorte EGFR. Este patrón concuerda con los resultados previos, donde los adenocarcinomas de pulmón del tipo KRAS presentaban un mayor grado de heterogeneidad y carga mutacional global más elevada que aquellos impulsados por EGFR.
+
+```{r, include=FALSE}
+# Guardar como imagen PNG
+png("figures/forest_plot_kras_vs_egfr.png", width = 800, height = 600)
+maftools::forestPlot(
+  mafCompareRes = mafCompare_kras_vs_egfr,
+  pVal = 0.01,
+  color = as.character(unlist(cohort_colors)),
+  geneFontSize = 1.3,
+  titleSize = 2,
+  lineWidth = 2.5
+)
+dev.off()
+```
+
+Para el análisis de enriquecimiento de rutas, se seleccionaron los DMGs en cada cohorte utilizando un umbral de significancia más laxo (p \< 0.05), recomendado en este tipo de análisis para aumentar la sensibilidad y capturar posibles vías relevantes.
+
+```{r, warning=FALSE, message=FALSE}
+res_mafComp <- mafCompare_kras_vs_egfr$results
+
+# Filtrar por pval < 0.05 y or > 1
+sig_genes_kras <- res_mafComp[
+  res_mafComp$pval < 0.05 &    # raw p-value
+  res_mafComp$or   > 1,        # more mutated in KRAS
+  "Hugo_Symbol"
+]
+
+# Filtra por pval < 0.05 y or > 1
+sig_genes_egfr <- res_mafComp[
+  res_mafComp$pval < 0.05 &    # raw p-value
+  res_mafComp$or   < 1,        # more mutated in KRAS
+  "Hugo_Symbol"
+]
+```
+
+```{r, echo=FALSE}
+sig_kras_HGNC <- sig_genes_kras$Hugo_Symbol
+sig_egfr_HGNC <- sig_genes_egfr$Hugo_Symbol
+
+# Cambiar nomenclatura de los genes a ENTREZID
+sig_kras_ENTREZID <- bitr(sig_kras_HGNC,
+                    fromType = "SYMBOL",
+                    toType = "ENTREZID",
+                    OrgDb = org.Hs.eg.db)
+
+sig_egfr_ENTREZID <- bitr(sig_egfr_HGNC,
+                    fromType = "SYMBOL",
+                    toType = "ENTREZID",
+                    OrgDb = org.Hs.eg.db)
+```
+
+A partir de estos genes, se llevó a cabo un análisis de enriquecimiento de rutas mediante las funciones enrichPathway (base de datos Reactome) y enrichKEGG (base de datos KEGG) del paquete clusterProfiler, empleando identificadores Entrez y especificando el organismo “Homo sapiens”.
+
+```{r, warning=FALSE, message=FALSE}
+# Reactome KRAS
+kras_reactome <- enrichPathway(
+  gene = sig_kras_ENTREZID$ENTREZID, 
+  organism = "human"
+  )
+
+# KEGG KRAS
+kras_kegg <- enrichKEGG(gene = sig_kras_ENTREZID$ENTREZID, organism = "hsa")
+
+# Reactome EGFR
+egfr_reactome <- enrichPathway(
+  gene = sig_egfr_ENTREZID$ENTREZID, 
+  organism = "human"
+  )
+
+# KEGG EGFR
+egfr_kegg <- enrichKEGG(gene = sig_egfr_ENTREZID$ENTREZID, organism = "hsa")
+```
+
+Para evitar rutas excesivamente inespecíficas o poco representativas, se filtraron aquellas rutas enriquecidas con al menos 3 genes:
+
+```{r}
+#Filtrar rutas relevantes
+
+# Para kras_reactome
+filtered_paths_kras_reactome <- kras_reactome@result[
+  kras_reactome@result$Count >= 3 & kras_reactome@result$Count <= 50, ]
+
+filtered_paths_kras_reactome <- filtered_paths_kras_reactome[order(filtered_paths_kras_reactome$p.adjust), ]
+
+
+# Para kras_kegg
+filtered_paths_kras_kegg <- kras_kegg@result[
+  kras_kegg@result$Count >= 4 & kras_kegg@result$Count <= 300, ]
+
+filtered_paths_kras_kegg <- filtered_paths_kras_kegg[order(filtered_paths_kras_kegg$p.adjust), ]
+
+
+# Para egfr_reactome
+filtered_paths_egfr_reactome <- egfr_reactome@result[
+  egfr_reactome@result$Count >= 4 & egfr_reactome@result$Count <= 50, ]
+
+filtered_paths_egfr_reactome <- filtered_paths_egfr_reactome[order(filtered_paths_egfr_reactome$p.adjust), ]
+
+
+# Para egfr_kegg
+filtered_paths_egfr_kegg <- egfr_kegg@result[
+  egfr_kegg@result$Count >= 4 & egfr_kegg@result$Count <= 300, ]
+
+filtered_paths_egfr_kegg <- filtered_paths_egfr_kegg[order(filtered_paths_egfr_kegg$p.adjust), ]
+
+```
+
+```{r}
+# KRAS - Reactome
+kras_reactome_1 <- c("827", "5340", "1288", "169044", "176")
+kras_reactome_2 <- c("4851", "176", "80731")
+
+# KRAS - KEGG
+kras_kegg <- c("3845", "472", "6935", "4851")
+
+# EGFR - Reactome
+egfr_reactome_ids <- c("1956", "7157", " 673", "5925") 
+
+# EGFR - KEGG
+egfr_kegg_ids <- c("1956", "7157", "673", "6416") 
+```
+
+```{r, warning=FALSE, message=FALSE}
+# KRAS - Reactome
+kras_reactome_HUGO_1 <- mapIds(org.Hs.eg.db, 
+                      keys = kras_reactome_1,   
+                      column = "SYMBOL",
+                      keytype = "ENTREZID",
+                      multiVals = "first") 
+kras_reactome_HUGO_1 <- unname(kras_reactome_HUGO_1)
+
+kras_reactome_HUGO_2 <- mapIds(org.Hs.eg.db, 
+                      keys = kras_reactome_2,   
+                      column = "SYMBOL",
+                      keytype = "ENTREZID",
+                      multiVals = "first") 
+kras_reactome_HUGO_2 <- unname(kras_reactome_HUGO_2)
+
+# KRAS - KEGG
+kras_kegg_HUGO <- mapIds(org.Hs.eg.db, 
+                      keys = kras_kegg,   
+                      column = "SYMBOL",
+                      keytype = "ENTREZID",
+                      multiVals = "first") 
+kras_kegg_HUGO <- unname(kras_kegg_HUGO)
+
+# EGFR - Reactome
+egfr_reactome_HUGO <- mapIds(org.Hs.eg.db, 
+                      keys = egfr_reactome_ids,
+                      column = "SYMBOL",
+                      keytype = "ENTREZID",
+                      multiVals = "first") 
+egfr_reactome_HUGO <- unname(egfr_reactome_HUGO)
+
+# EGFR - KEGG
+egfr_kegg_HUGO <- mapIds(org.Hs.eg.db, 
+                      keys = egfr_kegg_ids,
+                      column = "SYMBOL",
+                      keytype = "ENTREZID",
+                      multiVals = "first")
+egfr_kegg_HUGO <- unname(egfr_kegg_HUGO)
+
+
+# Reemplazar NA por "BRAF" en egfr_reactome_HUGO
+egfr_reactome_HUGO[is.na(egfr_reactome_HUGO)] <- "BRAF"
+```
+
+Finalmente, se visualizaron los genes implicados en las rutas seleccionadas mediante un oncoplot comparativo por cohorte.
+
+```{r}
+# Oncoplot para rutas KRAS - Reactome
+oncoplot(
+  maf = maf_kras,
+  genes = kras_reactome_HUGO_1,
+  sortByAnnotation = TRUE,
+  showTumorSampleBarcodes = FALSE
+)
+
+oncoplot(
+  maf = maf_kras,
+  genes = kras_reactome_HUGO_2,
+  sortByAnnotation = TRUE,
+  showTumorSampleBarcodes = FALSE
+)
+
+# Oncoplot para rutas KRAS - KEGG
+oncoplot(
+  maf = maf_kras,
+  genes = kras_kegg_HUGO,
+  sortByAnnotation = TRUE,
+  showTumorSampleBarcodes = FALSE
+)
+
+# Oncoplot para rutas EGFR - Reactome
+oncoplot(
+  maf = maf_egfr,
+  genes = egfr_reactome_HUGO,
+  sortByAnnotation = TRUE,
+  showTumorSampleBarcodes = FALSE
+)
+```
+
+En la cohorte KRAS, los genes seleccionados se asociaron significativamente con procesos relacionados con la organización de la matriz extracelular (ECM) y con enfermedades del metabolismo y de la glicosilación, según la base de datos Reactome. Respecto a la vía ECM, se identificaron genes como *ACAN*, *COL22A1* y *COL4A6*, cuya implicación en el adenocarcinoma de pulmón ha sido previamente documentada. Estudios recientes han propuesto firmas génicas pronósticas basadas en genes relacionados con membranas basales (incluyendo *ACAN* y *COL4A6*), asociadas con la supervivencia global en LUAD y validadas como factores pronósticos independientes en múltiples cohortes. Además, análisis proteómicos en modelos murinos de LUAD con mutaciones en *KRAS* han identificado una sobreexpresión de proteínas de la ECM, como Tenascina-C, asociada a mayor capacidad metastásica y peor pronóstico. En conjunto, estos resultados refuerzan el papel relevante de la remodelación de la ECM en la progresión tumoral del subtipo *KRAS*, y destacan la utilidad de estas vías como potenciales dianas terapéuticas o biomarcadores pronósticos.
+
+También se observaron vías enriquecidas relacionadas con enfermedades de la glicosilación y el metabolismo, encontrando en ambas la implicación de los genes *KRAS*, *ATM*, *ZEB1* y *NOTCH1*, cuya participación en la regulación del metabolismo tumoral y procesos de glicosilación está bien documentada. En adenocarcinomas, *KRAS* promueve la activación de la vía de la hexosamina, incrementando la O-GlcNAcilación de proteínas y favoreciendo la progresión tumoral mediante la evasión de la senescencia oncogénica. Por otro lado, se ha demostrado que la inhibición de *ATM* reduce tanto la glucólisis como la fosforilación oxidativa, sensibilizando a células de cáncer de pulmón resistentes, lo que respalda el papel de estos mecanismos en la adaptación metabólica y progresión tumoral. Asimismo, tanto *ZEB1* como *NOTCH1* se han asociado a procesos invasivos mediados por modificaciones en glicanos, como la sialilación, que modulan rutas de transición epitelio-mesénquima y señalización tumoral.
+
+Finalmente, el análisis con KEGG en la cohorte *KRAS* reveló un enriquecimiento en la vía de microRNAs en cáncer, lo que sugiere una posible desregulación post-transcripcional. Entre los genes implicados se encuentran *ACAN*, *THSD7B* y *NOTCH1*, descritos como dianas de distintos microRNAs cuya inhibición regula su expresión y modula procesos tumorales en LUAD y otros tumores. Estas rutas reflejan características moleculares distintivas del subtipo *KRAS* y refuerzan la utilidad de combinar diferentes bases de datos para obtener una visión funcional más completa del perfil mutacional.
+
+En la cohorte *EGFR*, se identificó un enriquecimiento en la vía “Enfermedades de la transducción de señales por receptores de factores de crecimiento y segundos mensajeros”, que refleja la importancia de la señalización mediada por receptores tirosina quinasa y segundos mensajeros en este subtipo tumoral. Los genes implicados en esta ruta incluyen *EGFR*, *TP53*, *BRAF* y *RB1*, todos ellos componentes clave en la regulación de procesos celulares esenciales como la proliferación, supervivencia y diferenciación. En condiciones normales, la unión de EGF a *EGFR* activa *RAS*, que recluta y activa a *BRAF* para iniciar la cascada MAPK/ERK y promover la proliferación celular. Sin embargo, algunas mutaciones en *BRAF* generan dímeros activos de forma independiente de *RAS*, de modo que, aunque *EGFR* sea bloqueado por inhibidores, como cetuximab, la señal pros-proliferativa sigue fluyendo a través de *MEK* y *ERK*. Por otro lado, la pérdida de función de *RB1* constituye un mecanismo alternativo de escape, ya que la inactivación de este supresor tumoral desregula el punto de control G₁/S, permitiendo la entrada en fase S y la proliferación celular independientemente de las señales de crecimiento externas. En nuestra cohorte, se observa que las mutaciones en *EGFR* y *TP53* con frecuencia coexisten con alteraciones en *BRAF* o en *RB1*, pero raramente en ambos simultáneamente, lo que sugiere que cada vía es suficiente para evadir la dependencia de *EGFR*: mientras *BRAF* mutante reactiva por debajo la vía MAPK/ERK, la inactivación de *RB1* revoca el control del ciclo celular y suprime la necesidad de señales mitogénicas.
+
+```{r, include=FALSE}
+# Guardar en formato oncoplot, usado en memoria.
+
+# Parámetros comunes para todos los coOncoplot
+common_args <- list(
+  sepwd_genes1     = 0,
+  sepwd_samples1   = 0,
+  sepwd_genes2     = 0,
+  sepwd_samples2   = 0,
+  colors           = NULL,
+  removeNonMutated = FALSE,
+  legend_height    = 4,
+  geneNamefont     = 3,
+  showSampleNames  = FALSE,
+  SampleNamefont   = 0,
+  barcode_mar      = 0,
+  outer_mar        = 11,
+  gene_mar         = 3,
+  legendFontSize   = 1.8,
+  titleFontSize    = 3,
+  keepGeneOrder    = FALSE,
+  bgCol            = "#CCCCCC",
+  borderCol        = "white"
+)
+
+# Función auxiliar para guardar cada coOncoplot como PNG
+guardar_coOncoplot <- function(m1, m2, genes, m1Name, m2Name, filename) {
+  # Iniciar dispositivo PNG
+  png(
+    filename = file.path("figures", filename),
+    width    = 2400,
+    height   = 600,
+    res      = 100
+  )
+  # Llamada a coOncoplot con todos los parámetros
+  do.call(
+    coOncoplot,
+    c(
+      list(
+        m1     = m1,
+        m2     = m2,
+        genes  = genes,
+        m1Name = m1Name,
+        m2Name = m2Name
+      ),
+      common_args
+    )
+  )
+  dev.off()
+}
+
+# 1) KRAS Reactome grupo 1  (m1 = maf_kras, m2 = maf_egfr)
+guardar_coOncoplot(
+  m1       = maf_kras,
+  m2       = maf_egfr,
+  genes    = kras_reactome_HUGO_1,
+  m1Name   = "KRAS",
+  m2Name   = "EGFR",
+  filename = "coOncoplot_kras_reactome1.png"
+)
+
+# 2) KRAS Reactome grupo 2  (m1 = maf_kras, m2 = maf_egfr)
+guardar_coOncoplot(
+  m1       = maf_kras,
+  m2       = maf_egfr,
+  genes    = kras_reactome_HUGO_2,
+  m1Name   = "KRAS",
+  m2Name   = "EGFR",
+  filename = "coOncoplot_kras_reactome2.png"
+)
+
+# 3) KRAS KEGG  (m1 = maf_kras, m2 = maf_egfr)
+guardar_coOncoplot(
+  m1       = maf_kras,
+  m2       = maf_egfr,
+  genes    = kras_kegg_HUGO,
+  m1Name   = "KRAS",
+  m2Name   = "EGFR",
+  filename = "coOncoplot_kras_kegg.png"
+)
+```
+
+### 3.4. Dominios proteicos diferencialmente mutados.
+
+En el análisis de dominios proteicos diferencialmente mutados se usó la función pfamDomains(), la cual recoge información sobre los cambios proteicos (en formato HGVSp) para analizar la posición y las anotaciones del transcrito, identificando y agrupando dichas mutaciones según los dominios afectados. Estas posiciones se mapean posteriormente en la base de datos de dominios Pfam:
+
+```{r, echo=FALSE, include=FALSE, warning=FALSE}
+kras.pfam <- pfamDomains(
+  maf = maf_kras,
+  AACol = NULL,
+  summarizeBy = "AAPos",
+  top = 5,
+  domainsToLabel = NULL,
+  baseName = NULL,
+  varClass = "nonSyn",
+  width = 5,
+  height = 5,
+  labelSize = 1
+)
+
+egfr.pfam <- pfamDomains(
+  maf = maf_egfr,
+  AACol = NULL,
+  summarizeBy = "AAPos",
+  top = 5,
+  domainsToLabel = NULL,
+  baseName = NULL,
+  varClass = "nonSyn",
+  width = 5,
+  height = 5,
+  labelSize = 1
+)
+```
+
+Tras el análisis, se representan a continuación los 10 dominios más mutados en cada una de las cohortes:
+
+```{r}
+kras_domains <- kras.pfam$domainSummary
+egfr_domains <- egfr.pfam$domainSummary
+
+# Elegir los 10 dominios más mutados
+top10_kras <- kras_domains %>% 
+  slice_max(nMuts, n = 10)
+
+rest_kras <- anti_join(kras_domains, top10_kras, by = "DomainLabel")
+
+top10_egfr <- egfr_domains %>% 
+  slice_max(nMuts, n = 10)
+rest_egfr <- anti_join(egfr_domains, top10_egfr, by = "DomainLabel")
+
+kras_plot <- ggplot() +
+  geom_point(data = rest_kras, aes(x = nMuts, y = nGenes, size = 0.5), color = "grey", alpha = 0.6) +
+  geom_point(data = top10_kras, aes(x = nMuts, y = nGenes, size = nMuts), color = "red") +
+  geom_text_repel(
+    data = top10_kras,
+    aes(x = nMuts, y = nGenes, label = DomainLabel),
+    color = "red",
+    size = 4,  # ← más grande
+    box.padding = 0.3,
+    max.overlaps = Inf,
+    force = 1.5
+  ) +
+  scale_size_continuous(range = c(2, 6)) +
+  labs(
+    x = "# mutations",
+    y = "# genes",
+    title = "KRAS – Pfam domain mutations"
+    # size eliminado del título
+  ) +
+  guides(size = "none") +  # ← quita leyenda
+  theme_minimal(base_size = 12)+
+  theme(
+    axis.line = element_line(color = "black", size = 0.5),
+    axis.ticks = element_line(color = "black", size = 0.6)
+  )
+
+ggsave("figures/kras_pfam_plot_forzado.png", kras_plot, width = 6, height = 5, dpi = 300)
+
+# Mostrar el gráfico
+print(kras_plot)
+
+egfr_plot <- ggplot() +
+  geom_point(data = rest_egfr, aes(x = nMuts, y = nGenes, size = 0.5), color = "grey", alpha = 0.6) +
+  geom_point(data = top10_egfr, aes(x = nMuts, y = nGenes, size = nMuts), color = "blue") +
+  geom_text_repel(
+    data = top10_egfr,
+    aes(x = nMuts, y = nGenes, label = DomainLabel),
+    color = "blue",
+    size = 4,  # ← más grande
+    box.padding = 0.3,
+    max.overlaps = Inf,
+    force = 1.5
+  ) +
+  scale_size_continuous(range = c(2, 6)) +
+  labs(
+    x = "# mutations",
+    y = "# genes",
+    title = "EGFR – Pfam domain mutations"
+    # size eliminado del título
+  ) +
+  guides(size = "none") +  # ← quita leyenda
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.line = element_line(color = "black", size = 0.5),
+    axis.ticks = element_line(color = "black", size = 0.6)
+  )
+
+ggsave("figures/egfr_pfam_plot_forzado.png", egfr_plot, width = 6, height = 5, dpi = 300)
+
+# Mostrar el gráfico
+print(egfr_plot)
+```
+
+Para comparar y clasificar los dominios más mutados entre las cohortes KRAS y EGFR, se seleccionaron los 20 dominios más mutados y se realizó una unión de ambos conjuntos para identificar los dominios que son exclusivos de EGFR, KRAS o comunes a ambos:
+
+```{r}
+kras_top20 <- kras_domains %>%
+  slice_head(n = 20) %>%
+  dplyr::select(DomainLabel) %>%
+  mutate(KRAS = TRUE)
+
+egfr_top20 <- egfr_domains %>%
+  slice_head(n = 20) %>%
+  dplyr::select(DomainLabel) %>%
+  mutate(EGFR = TRUE)
+
+# Unir y ver qué dominios están en KRAS, EGFR o ambos
+domain_comparison <- full_join(kras_top20, egfr_top20, by = "DomainLabel") %>%
+  # sustituir NAs por FALSE
+  mutate(
+    KRAS = if_else(is.na(KRAS), FALSE, KRAS),
+    EGFR = if_else(is.na(EGFR), FALSE, EGFR)
+  ) %>%
+  # crear la clasificación
+  mutate(classification = case_when(
+    KRAS & EGFR ~ "common",
+    KRAS        ~ "KRAS",
+    EGFR        ~ "EGFR"
+  )) %>%
+  # seleccionar solo DomainLabel y classification
+  dplyr::select(DomainLabel, classification)
+
+domain_comparison_final <- domain_comparison %>%
+  left_join(
+    kras_domains %>% dplyr::select(DomainLabel, Description),
+    by = "DomainLabel"
+  )
+
+```
+
+En la cohorte *KRAS*, el perfil de dominios PFAM pone de relieve una convergencia en los procesos de señalización intracelular y el control del tráfico vesicular, lo que probablemente potencie la capacidad proliferativa de las células tumorales. El enriquecimiento del dominio *COG1100*, asociado a GTPasas pequeñas como *SAR1*, sugiere un aumento en la dinámica de transporte entre retículo endoplásmico y Golgi. *SAR1* es una GTPasa que regula la formación de vesículas *COPII* en el retículo endoplásmico y conecta la disponibilidad de leucina con la vía *mTORC1*. La pérdida de función de *SAR1A/B* provoca una activación inespecífica de *mTORC1*, favoreciendo el crecimiento tumoral en modelos de adenocarcinoma de pulmón. Así, mutaciones que afecten el dominio *COG1100* de *SAR1* podrían potenciar la señalización *mTORC1* en LUAD *KRAS*-mutante, contribuyendo a la progresión tumoral.
+
+Por su parte, el dominio *PTPc*, presente en fosfatasas tirosina como *SHP2* (codificada por *PTPN11*), es clave para la activación de la vía *RAS/MAPK*. En modelos murinos de LUAD inducido por *KRAS*, la deleción de *PTPN11* reduce drásticamente el desarrollo tumoral, evidenciando que la actividad de este dominio es esencial para la oncogénesis dependiente de *KRAS*. Por tanto, mutaciones activadoras podrían amplificar la señal *MAPK/ERK* en la cohorte *KRAS*, mientras que su inhibición representaría una posible vía terapéutica al frenar la proliferación celular.
+
+Como cabía esperar, en la cohorte *EGFR* destaca el dominio *PTKc_EGFR*, un dominio catalítico de la tirosina quinasa de *EGFR* altamente propenso a mutaciones activadoras en LUAD, incluyendo *L858R* y deleciones en el exón 19. Estas variantes generan una activación constitutiva del receptor, activando las rutas *RAS/MAPK* y *PI3K/AKT* incluso en ausencia del ligando, favoreciendo una proliferación tumoral sostenida. En cambio, otros dominios como *WD40* promueven la proliferación tumoral al sufrir mutaciones de pérdida de función. Estos dominios están presentes en proteínas ligasa E3, como *FBXW7*, que regula la degradación de múltiples oncoproteínas. De este modo, la pérdida de función de *FBXW7* favorecería la acumulación intracelular de *EGFR* y otras proteínas promotoras de crecimiento, potenciando vías como *EGFR/ERK*.
+
+```{r, include=FALSE}
+# Guardar el dataframe como un archivo Excel
+library(openxlsx)
+write.xlsx(domain_comparison_final, file = "results/domain_comparison_filter.xlsx")
+```
+
+### 3.5. Somatic Interactions
+
+El análisis de interacción somática tiene como objetivo identificar patrones de co-ocurrencia y exclusión mutua entre genes comúnmente mutados, los cuales pueden reflejar mecanismos moleculares desconocidos en la progresión tumoral.
+
+Para identificar relaciones de co-ocurrencia o exclusión mutua entre genes frecuentemente mutados, se empleó la función somaticInteractions() a cada una de las cohortes:
+
+```{r, warning=FALSE, message=FALSE}
+kras_interactions <- somaticInteractions(
+  maf = maf_kras,
+  top = 25,
+  genes = NULL,
+  pvalue = c(0.05, 0.01),
+  returnAll = TRUE,
+  geneOrder = NULL,
+  fontSize = 0.8,
+  showSigSymbols = TRUE,
+  showCounts = FALSE,
+  countStats = "all",
+  countType = "all",
+  countsFontSize = 0.8,
+  countsFontColor = "black",
+  colPal = "BrBG",
+  showSum = TRUE,
+  colNC = 9,
+  nShiftSymbols = 5,
+  sigSymbolsSize = 2,
+  sigSymbolsFontSize = 0.9,
+  pvSymbols = c(46, 42),
+  limitColorBreaks = TRUE
+)
+
+egfr_interactions <- somaticInteractions(
+  maf = maf_egfr,
+  top = 25,
+  genes = NULL,
+  pvalue = c(0.05, 0.01),
+  returnAll = TRUE,
+  geneOrder = NULL,
+  fontSize = 0.8,
+  showSigSymbols = TRUE,
+  showCounts = FALSE,
+  countStats = "all",
+  countType = "all",
+  countsFontSize = 0.8,
+  countsFontColor = "black",
+  colPal = "BrBG",
+  showSum = TRUE,
+  colNC = 9,
+  nShiftSymbols = 5,
+  sigSymbolsSize = 2,
+  sigSymbolsFontSize = 0.9,
+  pvSymbols = c(46, 42),
+  limitColorBreaks = TRUE
+)
+```
+
+```{r, include=FALSE}
+# Guardar plot para KRAS
+png(filename = "figures/somatic_interactions_kras.png", width = 1000, height = 800, res = 150)
+somaticInteractions(
+  maf = maf_kras,
+  top = 25,
+  pvalue = c(0.05, 0.01),
+  returnAll = TRUE,
+  fontSize = 0.8,
+  showSigSymbols = TRUE,
+  showCounts = FALSE,
+  countStats = "all",
+  countType = "all",
+  countsFontSize = 0.8,
+  countsFontColor = "black",
+  colPal = "BrBG",
+  showSum = TRUE,
+  colNC = 9,
+  nShiftSymbols = 5,
+  sigSymbolsSize = 2,
+  sigSymbolsFontSize = 0.9,
+  pvSymbols = c(46, 42),
+  limitColorBreaks = TRUE
+)
+dev.off()
+
+# Guardar plot para EGFR
+png(filename = "figures/somatic_interactions_egfr.png", width = 1000, height = 800, res = 150)
+somaticInteractions(
+  maf = maf_egfr,
+  top = 25,
+  pvalue = c(0.05, 0.01),
+  returnAll = TRUE,
+  fontSize = 0.8,
+  showSigSymbols = TRUE,
+  showCounts = FALSE,
+  countStats = "all",
+  countType = "all",
+  countsFontSize = 0.8,
+  countsFontColor = "black",
+  colPal = "BrBG",
+  showSum = TRUE,
+  colNC = 9,
+  nShiftSymbols = 5,
+  sigSymbolsSize = 2,
+  sigSymbolsFontSize = 0.9,
+  pvSymbols = c(46, 42),
+  limitColorBreaks = TRUE
+)
+dev.off()
+```
+
+Posteriormente, se extrajeron específicamente los pares de genes con interacciones de exclusión mutua estadísticamente significativos (p \< 0.05), con la finalidad de analizar los resultados y encontrar patrones y motivos biológicos que justifiquen tales interacciones:
+
+```{r}
+# Filtrar los pares mutuamente excluyentes con p-valor < 0.05
+# Filtrar los pares mutuamente excluyentes con p-valor < 0.05
+exclusive_pairs <- kras_interactions[
+  kras_interactions$Event == "Mutually_Exclusive" & kras_interactions$pValue < 0.05,
+  c("gene1", "gene2", "pValue")
+]
+
+# Crear columna con el nombre del par
+exclusive_pairs$`Exclusión mutua` <- paste0(exclusive_pairs$gene1, "–", exclusive_pairs$gene2)
+
+# Crear columna de estrellas de significancia
+exclusive_pairs$Significancia <- cut(
+  exclusive_pairs$pValue,
+  breaks = c(-Inf, 0.001, 0.01, 0.05),
+  labels = c("***", "**", "*")
+)
+
+# Seleccionar y reordenar columnas
+formatted_table <- exclusive_pairs[, c("Exclusión mutua", "pValue", "Significancia")]
+
+# Mostrar tabla final
+print(formatted_table, row.names = FALSE)
+```
+
+```{r, include=FALSE}
+# Guardar la tabla
+write.xlsx(formatted_table, file = "results/exclusiones_kras.xlsx", rowNames = FALSE)
+```
+
+Entre las principales exclusiones encontradas en pacientes KRAS, destacamos *STK11* y *TP53*, cuya interacción se encuentra ampliamente respaldada por la literatura. Biológicamente, esta exclusión refleja rutas tumorales divergentes: *TP53* mutado favorece mayor proliferación al evadir el control del ciclo celular, mientras que *STK11* compromete la señalización metabólica y promueve un microambiente inmunológico “frío” (poca infiltración de linfocitos CD8). Otro caso detectado de exclusión mutua en la cohorte KRAS es el de KEAP1 y LRP1B, ambos supresores tumorales con funciones moleculares distintas: *KEAP1* regula la vía antioxidante NRF2106, y *LRP1B* parece regular la vía inflamatoria IL-6–JAK–STAT3107. No existe literatura que documente explícitamente una exclusión entre ambos genes, aunque algunos estudios sugieren que tienden a aparecer en tumores distintos.
+
+Sin embargo, en la cohorte EGFR no se observó ningún caso de exclusión mutua. Para explicar este hecho deben considerarse varios factores: Los adenocarcinomas impulsados por *EGFR* son menos comunes, generando una cohorte más pequeña y con una carga mutacional global menor en comparación con tumores *KRAS*, debido a que se asocian con menor frecuencia a un hábito tabáquico, tal y como se ha explicado previamente en este trabajo. La baja frecuencia mutacional hace menos probable la aparición de mutaciones secundarias que puedan asumir un rol oncogénico paralelo a los genes de las rutas *RAS/MAPK* o *PI3K/AKT110*.
+
+### 3.6. Análisis de supervivencia global
+
+La supervivencia global (OS) es una métrica fundamental en oncología para evaluar el pronóstico y la eficacia de los tratamientos en pacientes con cáncer. Esta hace referencia al tiempo transcurrido desde el diagnóstico o inicio del tratamiento hasta la muerte por cualquier causa.
+
+Para comparar la evolución clínica de los pacientes en cada cohorte se realizó un análisis de supervivencia usando `SurvGroup()`, la cual permite identificar combinaciones de genes, cuyas mutaciones simultáneas se asocian significativamente con una peor supervivencia global. Los parámetros establecidos exploraban combinaciones de dos genes entre los 200 más frecuentemente mutados en el maf general, considerando solo aquellas mutaciones presentes en, al menos, cinco pacientes.
+
+```{r, warning=FALSE, message=FALSE}
+#Using top 20 mutated genes to identify a set of genes (of size 2) to predict poor prognostic groups
+prog_geneset = survGroup(
+  maf = maf_LUAD_SinFlags, 
+  top = 200, 
+  genes = NULL,
+  geneSetSize = 2,
+  minSamples = 5,
+  clinicalData = NULL,
+  time = "CDR_OS.time", 
+  Status = "CDR_OS", 
+  verbose = FALSE)
+```
+
+Tras ello, se filtraron aquellas combinaciones con significación estadística (p \< 0.05) relacionadas con *KRAS* o *EGFR*, las dos principales mutaciones de interés en este estudio.
+
+```{r}
+df_kras_prog <- prog_geneset %>%
+  filter(grepl("KRAS", Gene_combination, ignore.case = TRUE))
+
+df_egfr_prog <- prog_geneset %>%
+  filter(grepl("EGFR", Gene_combination, ignore.case = TRUE))
+
+df_kras_prog_sig <- df_kras_prog[df_kras_prog$P_value < 0.05, ]
+df_egfr_prog_sig <- df_egfr_prog[df_egfr_prog$P_value < 0.05, ]
+
+# Añadir columna de cohorte a cada dataframe
+df_kras_prog_sig$cohorte <- "KRAS"
+df_egfr_prog_sig$cohorte <- "EGFR"
+
+# Renombrar columnas
+df_kras_prog_sig <- df_kras_prog_sig[, c("Gene_combination", "P_value", "Mutant", "cohorte")]
+df_egfr_prog_sig <- df_egfr_prog_sig[, c("Gene_combination", "P_value", "Mutant", "cohorte")]
+colnames(df_kras_prog_sig) <- c("Gene_combination", "P_valor", "Nº_pacientes", "cohorte")
+colnames(df_egfr_prog_sig) <- c("Gene_combination", "P_valor", "Nº_pacientes", "cohorte")
+
+# Combinar
+tabla_combinada <- rbind(df_kras_prog_sig, df_egfr_prog_sig)
+
+# Ver tabla
+print(tabla_combinada)
+```
+
+```{r, include=FALSE}
+# Guardar la tabla combinada en un archivo Excel
+library(openxlsx)
+write.xlsx(tabla_combinada, file = "results/prog_genes_2.xlsx")
+```
+
+Por último, los resultados se visualizaron mediante gráficos de supervivencia generados con mafSurvGroup()
+
+```{r, warning=FALSE, message=FALSE}
+mafSurvGroup(
+  maf = maf_LUAD_SinFlags, 
+  geneSet = c("KRAS", "GRIN2B"), 
+  clinicalData = NULL,
+  time = "CDR_OS.time", 
+  Status = "CDR_OS",
+  )
+
+mafSurvGroup(
+  maf = maf_LUAD_SinFlags, 
+  geneSet = c("KRAS", "HECW1"), 
+  clinicalData = NULL,
+  time = "CDR_OS.time", 
+  Status = "CDR_OS",
+  )
+
+mafSurvGroup(
+  maf = maf_LUAD_SinFlags, 
+  geneSet = c("EGFR", "CPS1"), 
+  clinicalData = NULL,
+  time = "CDR_OS.time", 
+  Status = "CDR_OS",
+  )
+
+mafSurvGroup(
+  maf = maf_LUAD_SinFlags, 
+  geneSet = c("EGFR", "MYH4"), 
+  clinicalData = NULL,
+  time = "CDR_OS.time", 
+  Status = "CDR_OS",
+  )
+```
+
+```{r, include=FALSE}
+# KRAS-GRIN2B
+png("figures/KRAS_GRIN2B_OS.png", width = 800, height = 600, res=175)
+mafSurvGroup(
+  maf = maf_LUAD_SinFlags,
+  geneSet = c("KRAS", "GRIN2B"),
+  clinicalData = NULL,
+  time = "CDR_OS.time",
+  Status = "CDR_OS"
+)
+dev.off()
+
+# KRAS-HECW1
+png("figures/KRAS_HECW1_OS.png", width = 800, height = 600, res=175)
+mafSurvGroup(
+  maf = maf_LUAD_SinFlags,
+  geneSet = c("KRAS", "HECW1"),
+  clinicalData = NULL,
+  time = "CDR_OS.time",
+  Status = "CDR_OS"
+)
+dev.off()
+
+# EGFR-CPS1
+png("figures/EGFR_CPS1_OS.png", width = 800, height = 600, res=175)
+mafSurvGroup(
+  maf = maf_LUAD_SinFlags,
+  geneSet = c("EGFR", "CPS1"),
+  clinicalData = NULL,
+  time = "CDR_OS.time",
+  Status = "CDR_OS"
+)
+dev.off()
+
+# EGFR-MYH4
+png("figures/EGFR_MYH4_OS.png", width = 800, height = 600, res=175)
+mafSurvGroup(
+  maf = maf_LUAD_SinFlags,
+  geneSet = c("EGFR", "MYH4"),
+  clinicalData = NULL,
+  time = "CDR_OS.time",
+  Status = "CDR_OS"
+)
+dev.off()
+```
+
+Con los parámetros establecidos, `survGroup()` identificó diez genes cuya mutación, en combinación con *KRAS*, presentaban una reducción significativa en la OS en comparación con el resto de pacientes. Sin embargo, únicamente dos genes alterados junto a EGFR mostraron dicho efecto. Existen dos motivos que justifican este hecho: en primer lugar, los adenocarcinomas *KRAS* tienden a asociarse con un pronóstico más desfavorable en comparación con aquellos *EGFR*, independientemente de las mutaciones secundarias que complementen la oncogénesis. En segundo lugar, las mutaciones *KRAS* son más prevalentes en la población con LUAD, encontrando 157 pacientes portadores en esta cohorte de TCGA, frente a solo 68 con mutaciones en *EGFR*. Una cohorte de pacientes más extensa permite identificar una mayor variedad de combinaciones perjudiciales, pues parámetros como *minSamples* resultan menos restrictivos al disponer de mayor cobertura de pacientes.

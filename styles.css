@@ -1,0 +1,5 @@
+/* Justificar texto para que quede alineado a ambos lados */
+.main-container {
+  text-align: justify;
+}
+

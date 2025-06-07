@@ -1,4 +1,13 @@
 .Rhistory
 .RData
-.RDataTmp
-.Rproj.user/
+.Rproj.user
+.Rprofile
+.Ruserdata
+*.Rout
+*.Rout.save
+*.nb.html
+renv/library/
+tmp/
+tmp1/
+tmp2/
+.Rdatatmp/
